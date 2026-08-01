@@ -30,8 +30,8 @@ mahjonggame.hk/learn/hk-mahjong/scoring. Do not change them.
 - 七對子 (Seven Pairs): NOT a valid hand in this ruleset. [VERIFIED — excluded]
 
 ## 3. Minimum to win (起糊)
-- Minimum: **3 fan (三番起糊)**.
-- Bonus/flower fan DO count toward reaching the minimum. 
+- Minimum: **3 fan (三番起糊)**. [VERIFIED]
+- Bonus/flower fan DO count toward reaching the minimum. [VERIFIED]
 
 ## 4. Fan table (番數) — [VERIFIED against source]
 Fan values are ADDITIVE and stack unless marked "Limit". Limit hands pay the
@@ -98,9 +98,13 @@ Note: round wind == seat wind counts twice (2 fan total).
 ### Stacking examples (for tests)
 - Concealed + All Pungs + Full Flush = 1 + 3 + 7 = 11 fan.
 - Full Flush + All Pungs = 7 + 3 = 10 fan.
+- Great Four Winds + All Pungs + Half Flush = 10 + 3 + 3 = 16 → capped to 13.
+- Absorption: 大三元/小三元/大四喜/小四喜 absorb their component 箭刻/門風/圈風
+  pung fans, but do NOT absorb 對對糊 — all-pungs stacks whenever the hand is
+  in fact all pungs.
 
 ## 5. Cap (封頂 / 爆棚)
-- Cap at **13 fan**. Any hand ≥ 13 pays the 13-fan amount.
+- Cap at **13 fan**. [VERIFIED] Any hand ≥ 13 pays the 13-fan amount.
 
 ## 6. Payment
 Fan → points, doubling schedule, extended to the 13-fan cap:
@@ -119,17 +123,25 @@ Fan → points, doubling schedule, extended to the 13-fan cap:
 | 12 | 256 |
 | 13 (cap) | 384 |
 
-- Discard win (出銃): discarder pays the full amount alone. 
-- Self-draw (自摸): all three players pay. 
-- False win (詐糊): penalty applies. 
+(Note: 11/12/13-fan point values are extrapolated by doubling — verify against
+開心鬥一番 if the app displays payouts at those fan levels.)
+
+- Discard win (出銃): discarder pays the full amount alone. [VERIFIED]
+- Self-draw (自摸): all three players pay. [VERIFIED]
+- False win (詐糊): penalty applies. [VERIFIED]
 
 ## 7. Play flow
 - Seats 東南西北; dealer (莊) is 東.
-- Dealer keeps dealing (連莊) on a win or draw. 
+- Dealer keeps dealing (連莊) on a win or draw. [VERIFIED]
 - 13 tiles each; dealer draws to 14 to open each turn.
-- Dead wall for kong + flower replacements.
-- Discard priority: 食糊 > 碰/槓 > 上 (pong/kong beats chow); win beats all.
-- Flowers drawn are set aside face-up and immediately replaced from the dead wall.
+- **No dead wall.** All tiles after dealing form one wall: 144 − 53 dealt
+  (13×3 + dealer's 14) = 91 drawable tiles. Normal turns draw from the
+  front; kong and flower replacements draw from the back of the same wall.
+- 流局 (exhaustive draw): when the wall is empty (front and back meet), the hand
+  ends in a draw — no winner, no payment.
+- Discard priority: 食糊 > 碰/槓 > 上 (pung/kong beats chow); win beats all.
+- Flowers drawn are set aside face-up and immediately replaced from the back of
+  the wall.
 
 ## 8. Explicit invariants (for tests)
 - Shanten never increases after an optimal draw-and-discard.
