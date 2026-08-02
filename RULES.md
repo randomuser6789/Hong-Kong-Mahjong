@@ -139,6 +139,10 @@ Fan → points, doubling schedule, extended to the 13-fan cap:
   front; kong and flower replacements draw from the back of the same wall.
 - 流局 (exhaustive draw): when the wall is empty (front and back meet), the hand
   ends in a draw — no winner, no payment.
+- A kong called when the wall is already empty is still legal — it forms
+  the meld normally, but draws no replacement tile (there is none). Play
+  proceeds straight toward 流局 with no crash and no special-casing beyond
+  skipping the replacement draw.
 - Discard priority: 食糊 > 碰/槓 > 上 (pung/kong beats chow); win beats all.
 - Flowers drawn are set aside face-up and immediately replaced from the back of
   the wall.

@@ -1,0 +1,18 @@
+# Python bytecode caches -- must never be committed. Stale .pyc files can
+# mask source edits during rapid iterative testing (e.g. patch-a-file,
+# rerun-tests, restore-the-file cycles), causing tests to silently run
+# against old code. See CLAUDE.md for the PYTHONDONTWRITEBYTECODE guidance
+# that prevents this at the source.
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test/tooling caches
+.pytest_cache/
+
+# Editor/OS noise
+.DS_Store
+
+# Virtual environments
+.venv/
+venv/

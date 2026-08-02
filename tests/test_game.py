@@ -3,16 +3,28 @@
 Target API (not yet implemented): mahjong/game.py
 
     GameState -- plain dataclass, fields:
-        wall: list[int]            remaining tiles; wall[0] is drawn next
+        wall: list[int]            remaining tiles. Normal draws take
+                                    wall[0] (the front); kong replacement
+                                    draws take wall[-1] (the back) -- see
+                                    apply_action's 'kong' below. 流局 (wall
+                                    exhaustion) is simply len(wall) == 0,
+                                    regardless of which end emptied it
+                                    last: front and back "meet" there.
         hands: list[list[int]]     4 seats' concealed tiles
-        melds: list[list[list[int]]]  4 seats' exposed melds; each seat's
-                                    entry is a list of melds, each meld a
-                                    list of exactly 3 tile ints. Only pung
-                                    exists so far, so every meld is exposed
-                                    (no concealed-kong case yet) -- storing
-                                    them here at all is what lets a later
-                                    scoring pass tell concealed vs. exposed
-                                    apart (e.g. for 門前清 eligibility).
+        melds: list[list[dict]]    4 seats' melds; each seat's entry is a
+                                    list of {'tiles': list[int], 'concealed':
+                                    bool} dicts -- 'tiles' has 3 entries for
+                                    pung/chow, 4 for any kong (exposed,
+                                    concealed, or added). 'concealed' is
+                                    True only for a concealed kong (暗槓);
+                                    pung, chow, exposed kong (明槓), and
+                                    added kong (加槓) are all False -- this
+                                    is what lets a later scoring pass tell
+                                    concealed vs. exposed apart (e.g. for
+                                    門前清 eligibility), and is why melds
+                                    are dicts rather than bare tile lists:
+                                    a 4-tile meld is otherwise ambiguous
+                                    between exposed and concealed kong.
         discards: list[list[int]]  4 seats' discard piles, in order
         current_turn: int          seat index (0-3) currently acting -- the
                                     current player during normal turns, OR
@@ -34,34 +46,44 @@ Target API (not yet implemented): mahjong/game.py
                                     populated when phase ==
                                     'awaiting_claim_decision'. Each entry is
                                     {'seat': int, 'type': 'discard_win' |
-                                    'pung' | 'chow'}; chow entries have an
-                                    extra 'tiles': (a, b, c) -- the sorted
-                                    3-tile run this specific chow option
-                                    would form (see below).
+                                    'pung' | 'kong' | 'chow'}; chow entries
+                                    have an extra 'tiles': (a, b, c) -- the
+                                    sorted 3-tile run this specific chow
+                                    option would form (see below).
 
                                     Priority order is win > pung/kong > chow
                                     (RULES.md section 7). Entries are
-                                    grouped into GROUPS by (seat, type), in
+                                    grouped into GROUPS by (seat, TIER), in
                                     priority order -- that's the true unit
                                     of "one decision": all entries a single
                                     seat is being asked about at once for a
-                                    single claim type. "The current
-                                    decision" is always the entire front
-                                    group, not just entry [0]:
-                                    current_turn == pending_claims[0]['seat']
-                                    == every other entry in that same
-                                    group's seat, and likewise for type.
-                                    Grouping by (seat, type) rather than by
-                                    type alone matters because no claim type
-                                    can ever span two seats on one discard
-                                    today (see the per-tier reasoning
-                                    below), so type alone happens to
-                                    coincide with (seat, type) right now --
-                                    but the engine keys on the full pair so
-                                    it stays correct even if a future rule
-                                    ever let one type apply to two seats at
-                                    once (e.g. some house rules' 搶槓 variants
-                                    let multiple seats rob the same kong).
+                                    single priority tier (pung and kong
+                                    share a tier -- see below -- so a
+                                    3-holder's pung entry and kong entry are
+                                    ONE group, offered together, not
+                                    sequentially). "The current decision" is
+                                    always the entire front group, not just
+                                    entry [0]: current_turn ==
+                                    pending_claims[0]['seat'] == every other
+                                    entry in that same group's seat, and
+                                    likewise for tier (not necessarily type
+                                    -- pung and kong entries in the same
+                                    group have different types by design).
+                                    Grouping by (seat, tier) rather than by
+                                    type alone matters for two reasons: (1)
+                                    one seat can have two DIFFERENT types
+                                    (pung + kong) that must stay grouped
+                                    together, and (2) no claim TYPE can ever
+                                    span two DIFFERENT seats on one discard
+                                    (see the per-tier reasoning below), so
+                                    grouping only by type (ignoring seat)
+                                    would incorrectly bundle two different
+                                    seats' same-typed claims -- the engine
+                                    keys on the full (seat, tier) pair so it
+                                    stays correct even if a future rule ever
+                                    let one type apply to two seats at once
+                                    (e.g. some house rules' 搶槓 variants let
+                                    multiple seats rob the same kong).
                                       - win tier: at most 1 entry. 一炮多響
                                         (multiple simultaneous winners off
                                         one discard) is not used in this
@@ -71,12 +93,26 @@ Target API (not yet implemented): mahjong/game.py
                                         (discarder+3)%4 that can win takes
                                         it, even if a later seat in that
                                         rotation could also have won.
-                                      - pung tier: at most 1 entry -- each
-                                        tile type has only 4 copies total,
-                                        so two DIFFERENT non-discarder seats
-                                        each holding >=2 would require >=4
-                                        copies among just the two of them,
-                                        impossible.
+                                      - pung/kong tier: at most 2 entries,
+                                        both for the SAME single eligible
+                                        seat -- each tile type has only 4
+                                        copies total, so two DIFFERENT
+                                        non-discarder seats each holding >=2
+                                        would require >=4 copies among just
+                                        the two of them, impossible. That
+                                        one seat (if any) gets a 'pung'
+                                        entry whenever it holds >=2 of the
+                                        tile, AND ALSO a 'kong' entry
+                                        whenever it holds >=3 -- both are
+                                        offered together when it holds >=3,
+                                        letting the player freely choose:
+                                        konging is never forced just because
+                                        a 3rd copy is available, since
+                                        keeping it concealed is a legitimate
+                                        strategic choice. Kong is legal even
+                                        when the wall is empty -- see
+                                        apply_action's 'kong' below for what
+                                        happens to the replacement draw then.
                                       - chow tier: 0 or more entries, ALL
                                         for the SAME seat -- only
                                         (discarder+1)%4 may ever chow, but
@@ -108,24 +144,50 @@ Target API (not yet implemented): mahjong/game.py
         [] if state.status != 'in_progress'.
         [{'type': 'draw'}] if phase == 'awaiting_draw'.
         If phase == 'awaiting_claim_decision': one action per entry in the
-        front GROUP of pending_claims (every entry sharing BOTH
-        pending_claims[0]['seat'] and pending_claims[0]['type']) --
-        {'type': 'discard_win'} or {'type': 'pung'} (singletons), or one
-        {'type': 'chow', 'tiles': (a, b, c)} per distinct chow entry in
-        that group -- plus {'type': 'pass'}. The type/shape is derived
-        from the queue, never hardcoded, so kong slots in later without
-        changing this function.
+        front GROUP of pending_claims (every entry sharing both
+        pending_claims[0]['seat'] and pending_claims[0]'s priority tier --
+        NOT necessarily its exact type; see the field docs above) --
+        {'type': 'discard_win'}, {'type': 'pung'}, and/or {'type': 'kong'}
+        (a 3-holder sees BOTH pung and kong here together, never just
+        one), or one {'type': 'chow', 'tiles': (a, b, c)} per distinct
+        chow entry in that group -- plus
+        {'type': 'pass'}. The type/shape is derived from the queue, never
+        hardcoded, so concealed/added kong slot in later without changing
+        this function.
         If phase == 'awaiting_discard': one {'type': 'discard', 'tile': t}
-        per DISTINCT tile value in the current player's hand (sorted), plus
-        {'type': 'declare_win'} iff the current 14-tile hand is currently a
-        valid winning hand per mahjong.winning_hand.is_winning_hand. Declaring
-        is a choice, not forced -- min-fan gating belongs to a later scoring
-        pass, not this structural check.
+        per DISTINCT tile value in the current player's hand (sorted); plus
+        {'type': 'concealed_kong', 'tile': t} for each DISTINCT tile the
+        current player holds >=4 of; plus {'type': 'added_kong', 'tile': t}
+        for each tile t where the current player has an existing EXPOSED
+        pung meld (melds[current_turn] contains a {'tiles': [t,t,t],
+        'concealed': False} entry) AND holds >=1 more copy of t in hand;
+        plus {'type': 'declare_win'} iff the current player's hand is
+        currently a valid winning hand -- checked as the concealed hand
+        PLUS, for each existing meld, 3 representative tiles from it
+        (meld['tiles'][:3] -- a kong's 4th tile never counts toward
+        structure, matching how its replacement draw already compensates
+        for it), fed to mahjong.winning_hand.is_winning_hand. This combined
+        check (not just is_winning_hand(hand) on the bare concealed hand)
+        is what makes 槓上開花 (win on kong replacement) reachable at all
+        for a player who already has an exposed meld, since raw
+        is_winning_hand requires exactly 14 tiles and a player with any
+        prior meld never has 14 concealed tiles. Declaring a win is a
+        choice, not forced -- min-fan gating belongs to a later scoring
+        pass, not this structural check. This is also the phase
+        concealed_kong/added_kong resolve back into (see apply_action
+        below), so it's checked identically whether this is the start of
+        an ordinary turn or the moment right after a self-declared kong's
+        replacement draw.
         If phase == 'awaiting_meld_discard': discard options only, same
-        rule as above but WITHOUT declare_win -- a claimed meld (pung or
-        chow) can never itself complete a win (unlike robbing a kong,
-        which doesn't exist yet), so it would be wrong to offer it here
-        even if the 14 hand+meld tiles happen to look structurally complete.
+        rule as above but WITHOUT declare_win and WITHOUT concealed_kong/
+        added_kong -- a claimed meld (pung, kong, or chow) can never
+        itself complete a win (unlike robbing a kong via 搶槓, which
+        doesn't exist yet), and concealed/added kong may only be declared
+        right after drawing on your own turn, not in the forced discard
+        following a claim from someone else's discard (scope decision:
+        real rules do permit konging again off a kong-replacement draw
+        before discarding, which would need this restriction relaxed, but
+        that chain isn't implemented yet).
 
     apply_action(state, action) -> GameState
         Pure function: returns a NEW GameState, does not mutate the input
@@ -137,11 +199,12 @@ Target API (not yet implemented): mahjong/game.py
             hand, appends it to their discard pile. Then gathers ALL
             eligible claims into pending_claims, group by group in
             priority order: discard-win (see the field docs above for the
-            seat-order tiebreak), then pung, then chow (only
-            (current_turn+1)%4 may chow; a suited
-            tile T is chowable as (T,T+1,T+2)/(T-1,T,T+1)/(T-2,T-1,T)
-            wherever that seat's hand holds the other two tiles of the
-            shape; honors can never chow):
+            seat-order tiebreak), then pung/kong (see the field docs above
+            for how the single eligible seat's count picks which), then
+            chow (only (current_turn+1)%4 may chow; a suited tile T is
+            chowable as (T,T+1,T+2)/(T-1,T,T+1)/(T-2,T-1,T) wherever that
+            seat's hand holds the other two tiles of the shape; honors can
+            never chow):
                 - if pending_claims is non-empty: phase ->
                   'awaiting_claim_decision', current_turn ->
                   pending_claims[0]['seat'], last_discard/last_discarder ->
@@ -155,37 +218,96 @@ Target API (not yet implemented): mahjong/game.py
             self-draw's hand size at a win). status -> 'discard_win',
             winner -> current_turn. last_discard/last_discarder -> None,
             pending_claims -> [].
-        'pung' (only legal when the front group's type is 'pung'):
+        'pung' (only legal when 'pung' is in the front group's types --
+            i.e. the claiming seat holds >=2 of last_discard; this stays
+            legal even when it holds >=3, since punging a 3rd-copy hand
+            and keeping the extra tile concealed is a legitimate choice,
+            never forced into konging just because it's available):
             removes 2 copies of last_discard from the claiming seat's
-            hand, moves the pending tile OFF the discarder's discard pile
-            and combines all 3 into one exposed meld appended to
-            melds[current_turn]. current_turn stays put (the claimer),
+            hand (the rest, if any, stay in the concealed hand untouched),
+            moves the pending tile OFF the discarder's discard pile and
+            combines all 3 into one {'tiles': [t,t,t], 'concealed': False}
+            meld appended to melds[current_turn]. current_turn stays put (the claimer),
             phase -> 'awaiting_meld_discard' (they discard next, no draw).
             last_discard/last_discarder -> None, pending_claims -> []
             (accepting voids every other pending claim on this same
             discard -- it can only be claimed once).
+        'kong' (only legal when 'kong' is in the front group's types --
+            i.e. the claiming seat holds >=3 of last_discard; this is the
+            exposed discard-claim kong (明槓)): removes 3 copies of
+            last_discard from the claiming seat's hand, moves the pending
+            tile OFF the discarder's discard pile, and combines all 4 into
+            one {'tiles': [t,t,t,t], 'concealed': False} meld appended to
+            melds[current_turn]. Then, IF THE WALL IS NON-EMPTY, draws ONE
+            replacement tile from wall[-1] (the back -- see the wall field
+            docs above) directly into the claimer's hand. Konging with an
+            EMPTY wall is legal but draws no replacement -- it just
+            doesn't crash on popping an empty list, and the hand proceeds
+            toward wall_exhausted normally once the claimer's subsequent
+            discard resolves with no further claims (this is "front meets
+            back": the kong itself doesn't detect exhaustion, same as any
+            other discard). current_turn stays put (the claimer), phase ->
+            'awaiting_meld_discard' (they discard next -- the replacement
+            draw, if any, already happened as part of claiming, so this
+            is not a second 'draw'; declare_win is withheld here since a
+            CLAIMED kong, unlike a self-declared one, never completes a
+            win by itself -- see 'awaiting_meld_discard' above and
+            'concealed_kong'/'added_kong' below for the self-declared
+            case, which DOES allow it). last_discard/last_discarder ->
+            None, pending_claims -> [].
         'chow' (only legal when the front group's type is 'chow'; takes a
             'tiles': (a, b, c) matching one of the offered chow entries):
             removes the two tiles of (a, b, c) OTHER than last_discard
             from the claiming seat's hand, moves the pending tile OFF the
-            discarder's discard pile, combines all 3 into one exposed
-            meld appended to melds[current_turn]. Same
-            current_turn-stays-put / 'awaiting_meld_discard' / cleared
+            discarder's discard pile, combines all 3 into one
+            {'tiles': [a,b,c], 'concealed': False} meld appended to
+            melds[current_turn]. Same current_turn-stays-put /
+            'awaiting_meld_discard' / cleared
             last_discard-last_discarder-pending_claims behavior as 'pung'.
+        'concealed_kong' (only legal in 'awaiting_discard'; takes a
+            'tile': t where the current player holds >=4 copies of t --
+            this is 暗槓, declared on your own turn, never a discard
+            claim): removes all 4 copies of t from the current player's
+            hand and appends a NEW {'tiles': [t,t,t,t], 'concealed': True}
+            meld to melds[current_turn]. Then, IF THE WALL IS NON-EMPTY,
+            draws ONE replacement tile from wall[-1] into the hand (same
+            empty-wall handling as 'kong': legal, no crash, no
+            replacement, exhaustion resolves normally on the next
+            discard). current_turn and phase are both unchanged
+            ('awaiting_discard' -> 'awaiting_discard') -- unlike a claimed
+            kong, this is still the current player's own turn, so
+            declare_win IS checked again immediately after (this is what
+            makes 槓上開花 reachable off a concealed kong).
+        'added_kong' (only legal in 'awaiting_discard'; takes a 'tile': t
+            where melds[current_turn] contains an existing {'tiles':
+            [t,t,t], 'concealed': False} entry AND the hand holds >=1 more
+            copy of t -- this is 加槓): removes ONE copy of t from the
+            hand and appends it to that SAME existing meld dict's 'tiles'
+            in place (3 -> 4 tiles; 'concealed' stays False -- an added
+            kong is still exposed, since it started as an exposed pung).
+            No new meld entry is created. Same replacement-draw and
+            current_turn/phase-unchanged behavior as 'concealed_kong'
+            (declare_win checked again immediately after, for the same
+            槓上開花 reason). Robbing this kong (搶槓) is not implemented
+            yet -- declaring one never opens a claim window for other
+            seats here, though real rules allow it for added kong
+            specifically (never for concealed kong).
         'pass' (only legal in 'awaiting_claim_decision'): drops the ENTIRE
-            front GROUP -- every entry sharing BOTH pending_claims[0]['seat']
-            and pending_claims[0]['type'] -- not just entry [0]. (Grouping
-            by (seat, type) rather than type alone is what stays correct if
-            a future rule ever let one type apply to two seats at once; see
-            the pending_claims field docs above.) E.g. declining a chow
-            declines all its variants at once, since they're really one
-            decision ("do you want to chow at all") with multiple shapes.
-            If claims remain, offers the next group: current_turn -> that
-            group's seat, phase stays 'awaiting_claim_decision'. If none
-            remain, resolves exactly like the "otherwise" branch of
-            'discard' above, using
-            last_discarder as the reference seat; last_discard/
-            last_discarder -> None.
+            front GROUP -- every entry sharing both pending_claims[0]['seat']
+            and pending_claims[0]'s priority tier -- not just entry [0].
+            (Grouping by (seat, tier) rather than type alone is what lets
+            a 3-holder's pung and kong entries drop together as one
+            declined decision,
+            and what stays correct if a future rule ever let one type apply
+            to two seats at once; see the pending_claims field docs above.)
+            E.g. declining a chow declines all its variants at once, and
+            declining a pung+kong group declines both, since each is really
+            one decision ("do you want to claim this at all") with multiple
+            options. If claims remain, offers the next group: current_turn
+            -> that group's seat, phase stays 'awaiting_claim_decision'. If
+            none remain, resolves exactly like the "otherwise" branch of
+            'discard' above, using last_discarder as the reference seat;
+            last_discard/last_discarder -> None.
         'declare_win': status -> 'self_draw_win', winner -> current_turn.
 """
 
@@ -218,7 +340,7 @@ def total_tiles_in_play(state):
     return (
         sum(len(hand) for hand in state.hands)
         + sum(len(pile) for pile in state.discards)
-        + sum(len(meld) for seat_melds in state.melds for meld in seat_melds)
+        + sum(len(meld["tiles"]) for seat_melds in state.melds for meld in seat_melds)
         + len(state.wall)
     )
 
@@ -511,6 +633,104 @@ class TestHeavenlyHandReachability:
         assert new_state.winner == 0
 
 
+# --- declare_win generalizes to players who already have exposed melds -----
+#
+# is_winning_hand(tiles) requires EXACTLY 14 tiles. A player who has ever
+# claimed a pung/chow/kong has fewer concealed tiles than that from then
+# on, so legal_actions' declare_win check must combine the concealed hand
+# with 3 representative tiles per existing meld (meld['tiles'][:3] -- a
+# kong's 4th tile never counts toward structure) before calling
+# is_winning_hand, or self-draw win detection is silently broken for any
+# such player. This is a general bug, not kong-specific: it affects a
+# self-draw after an ordinary earlier pung or chow claim just as much as
+# it affects 槓上開花. These tests exercise the general "normal draw,
+# pre-existing meld from an EARLIER turn" path, separate from the
+# TestConcealedKong/TestAddedKong win-reachability tests (which exercise
+# it via a kong's own replacement draw specifically).
+#
+# They also verify the [:3] fix doesn't produce a false negative: since
+# is_winning_hand re-decomposes the flat 14-tile bag from scratch, feeding
+# it a chow's 3 distinct tiles or a kong's 3 (of 4) identical tiles as
+# "just more tiles in the bag" must still let it re-discover that exact
+# meld as part of a valid grouping, not fail to recombine correctly.
+
+def _combined_hand_win_scenario(existing_meld_tiles):
+    """Seat 0 already has one exposed meld (whatever tiles are passed in --
+    pung, chow, or kong) from an earlier turn. Concealed hand is tenpai
+    (10 tiles: budget is 14 - 3 for the existing meld - 1 not-yet-drawn),
+    waiting on a tanki pin(5) pair; wall[0] is pin(5)."""
+    pre_draw_hand = [man(1), man(2), man(3), man(4), man(5), man(6),
+                      sou(1), sou(2), sou(3), pin(5)]
+    assert len(pre_draw_hand) == 10
+    filler13 = [man(9), man(9), pin(1), pin(1), sou(9), sou(9),
+                RED_DRAGON, RED_DRAGON, GREEN_DRAGON, GREEN_DRAGON,
+                WHITE_DRAGON, NORTH, NORTH]
+    state = GameState(
+        wall=[pin(5), man(8), man(7)],
+        hands=[pre_draw_hand, list(filler13), list(filler13), list(filler13)],
+        melds=[[{"tiles": list(existing_meld_tiles), "concealed": False}], [], [], []],
+        discards=[[], [], [], []],
+        current_turn=0,
+        phase="awaiting_draw",
+        status="in_progress",
+        winner=None,
+        dealer=0,
+        round_wind=EAST,
+        seat_winds=[EAST, SOUTH, WEST, NORTH],
+        last_discard=None,
+        last_discarder=None,
+    )
+    return state
+
+
+class TestDeclareWinWithExistingMelds:
+    def test_self_draw_win_is_legal_after_an_earlier_pung(self):
+        state = _combined_hand_win_scenario([EAST, EAST, EAST])
+        drawn = apply_action(state, {"type": "draw"})
+
+        assert {"type": "declare_win"} in legal_actions(drawn)
+        won = apply_action(drawn, {"type": "declare_win"})
+        assert won.status == "self_draw_win"
+        assert won.winner == 0
+
+    def test_self_draw_win_is_legal_after_an_earlier_chow(self):
+        state = _combined_hand_win_scenario([pin(1), pin(2), pin(3)])
+        drawn = apply_action(state, {"type": "draw"})
+
+        assert {"type": "declare_win"} in legal_actions(drawn)
+        won = apply_action(drawn, {"type": "declare_win"})
+        assert won.status == "self_draw_win"
+        assert won.winner == 0
+
+    def test_self_draw_win_is_legal_after_an_earlier_kong(self):
+        # The existing meld has 4 physical tiles; the win-check must use
+        # only 3 of them as the structural representative, exactly as it
+        # does for TestConcealedKong/TestAddedKong's OWN replacement-draw
+        # win, but here the kong was already sitting there from a prior
+        # turn -- this is the "re-decomposition doesn't choke on it"
+        # verification, independent of the kong-declaration mechanics.
+        state = _combined_hand_win_scenario([SOUTH, SOUTH, SOUTH, SOUTH])
+        drawn = apply_action(state, {"type": "draw"})
+
+        assert {"type": "declare_win"} in legal_actions(drawn)
+        won = apply_action(drawn, {"type": "declare_win"})
+        assert won.status == "self_draw_win"
+        assert won.winner == 0
+
+    def test_a_non_completing_draw_with_an_existing_meld_does_not_offer_declare_win(self):
+        # Sanity check on the fix itself, not just its positive case:
+        # drawing a tile that does NOT complete the tenpai hand (instead
+        # of pin(5)) must correctly leave declare_win unavailable --
+        # confirms the combined-hand check isn't accidentally too
+        # permissive (e.g. always True once any meld exists).
+        state = _combined_hand_win_scenario([EAST, EAST, EAST])
+        state.wall[0] = NORTH  # front of the wall: a non-completing tile
+        drawn = apply_action(state, {"type": "draw"})
+
+        assert NORTH in drawn.hands[0]
+        assert {"type": "declare_win"} not in legal_actions(drawn)
+
+
 # --- wall exhaustion (流局) ----------------------------------------------------
 
 class TestWallExhaustion:
@@ -627,7 +847,7 @@ class TestPung:
 
         assert claimed.current_turn == 2  # jumped straight to the claimer, skipping seat 1
         assert claimed.phase == "awaiting_meld_discard"
-        assert claimed.melds[2] == [[T, T, T]]
+        assert claimed.melds[2] == [{"tiles": [T, T, T], "concealed": False}]
         assert claimed.hands[2].count(T) == 0
         assert len(claimed.hands[2]) == 11  # 13 - 2 claimed into the meld
         # the discarded tile moved out of the discard pile and into the meld
@@ -686,7 +906,7 @@ class TestPung:
 
         claimed = apply_action(after_discard, {"type": "pung"})
         claimed.hands[2].append(999)
-        claimed.melds[2][0].append(999)
+        claimed.melds[2][0]["tiles"].append(999)
         claimed.discards[0].append(999)
 
         assert after_discard.hands[2] == original_seat2_hand
@@ -858,7 +1078,7 @@ class TestChow:
 
         assert claimed.current_turn == 1
         assert claimed.phase == "awaiting_meld_discard"
-        assert claimed.melds[1] == [[pin(4), pin(5), pin(6)]]
+        assert claimed.melds[1] == [{"tiles": [pin(4), pin(5), pin(6)], "concealed": False}]
         assert sorted(claimed.hands[1]) == sorted(
             [pin(3), man(1), man(2), man(3), man(4), man(5), man(6), man(7), man(8), sou(1), sou(2)]
         )
@@ -1061,14 +1281,571 @@ class TestChow:
         ]
 
 
+# --- exposed kong (明槓), discard-claim form only ----------------------------
+
+def _kong_scenario(wall=None):
+    """Seat 0 discards T. Seat 2 (deliberately NOT the chow-eligible seat
+    1, to keep this isolated from chow) holds exactly 3 copies of T --
+    kong-eligible. Nobody else can win, pung, or chow on T."""
+    T = pin(5)
+    seat0_hand = [T, man(1), man(2), man(3), man(6), man(7), man(8),
+                  sou(1), sou(2), sou(3), sou(6), sou(7), sou(8), EAST]
+    seat1_hand = [man(1), man(2), man(3), man(4), man(5), man(6),
+                  man(7), man(8), man(9), sou(1), sou(2), NORTH, NORTH]
+    seat2_hand = [T, T, T, sou(3), sou(4), sou(5), sou(6), sou(7),
+                  sou(8), sou(9), RED_DRAGON, RED_DRAGON, GREEN_DRAGON]
+    seat3_hand = [pin(1), pin(1), pin(2), pin(2), pin(8), pin(8), pin(9),
+                  pin(9), sou(1), sou(1), GREEN_DRAGON, GREEN_DRAGON, NORTH]
+    state = GameState(
+        wall=wall if wall is not None else [man(9), man(8), man(7)],
+        hands=[seat0_hand, seat1_hand, seat2_hand, seat3_hand],
+        melds=[[], [], [], []],
+        discards=[[], [], [], []],
+        current_turn=0,
+        phase="awaiting_discard",
+        status="in_progress",
+        winner=None,
+        dealer=0,
+        round_wind=EAST,
+        seat_winds=[EAST, SOUTH, WEST, NORTH],
+        last_discard=None,
+        last_discarder=None,
+    )
+    return state, T
+
+
+class TestKong:
+    def test_three_holder_is_offered_both_pung_and_kong_together(self):
+        # Holding a 3rd copy must never force kong -- pung (keeping the
+        # 3rd tile concealed) is a legal, parallel choice, offered in the
+        # SAME group as kong, not as a fallback if kong is declined.
+        state, T = _kong_scenario()
+        after_discard = apply_action(state, {"type": "discard", "tile": T})
+
+        assert after_discard.phase == "awaiting_claim_decision"
+        assert after_discard.current_turn == 2
+        assert after_discard.pending_claims == [
+            {"seat": 2, "type": "pung"},
+            {"seat": 2, "type": "kong"},
+        ]
+        assert legal_actions(after_discard) == [
+            {"type": "pung"}, {"type": "kong"}, {"type": "pass"},
+        ]
+
+    def test_holding_exactly_two_offers_pung_only_no_kong(self):
+        state, T = _kong_scenario()
+        state.hands[2] = list(state.hands[2])
+        state.hands[2].remove(T)  # down to 2 copies
+        after_discard = apply_action(state, {"type": "discard", "tile": T})
+
+        assert after_discard.pending_claims == [{"seat": 2, "type": "pung"}]
+        assert legal_actions(after_discard) == [{"type": "pung"}, {"type": "pass"}]
+
+    def test_punging_a_three_holder_keeps_the_third_tile_concealed(self):
+        # Choosing 'pung' out of the offered {pung, kong} pair must use
+        # only 2 of the 3 held copies, leaving the 3rd in the concealed
+        # hand -- and must NOT touch the wall (no replacement for a pung).
+        state, T = _kong_scenario(wall=[man(9), man(8), man(7)])
+        after_discard = apply_action(state, {"type": "discard", "tile": T})
+        punged = apply_action(after_discard, {"type": "pung"})
+
+        assert punged.melds[2] == [{"tiles": [T, T, T], "concealed": False}]
+        assert punged.hands[2].count(T) == 1  # the 3rd copy stays concealed
+        assert punged.discards[0] == []  # claimed tile moved into the meld
+        assert punged.wall == after_discard.wall  # untouched -- no replacement draw
+        assert punged.phase == "awaiting_meld_discard"
+        assert punged.current_turn == 2
+
+    def test_claiming_kong_forms_the_meld_and_draws_replacement_from_the_back(self):
+        state, T = _kong_scenario(wall=[man(9), man(8), man(7)])
+        after_discard = apply_action(state, {"type": "discard", "tile": T})
+        claimed = apply_action(after_discard, {"type": "kong"})
+
+        assert claimed.current_turn == 2
+        assert claimed.phase == "awaiting_meld_discard"
+        assert claimed.melds[2] == [{"tiles": [T, T, T, T], "concealed": False}]
+        assert claimed.hands[2].count(T) == 0
+        assert claimed.discards[0] == []  # claimed tile moved into the meld
+
+        # Replacement is wall[-1] (man(7)), NOT wall[0] (man(9)).
+        assert man(7) in claimed.hands[2]
+        assert man(9) not in claimed.hands[2]
+
+    def test_wall_shrinks_from_the_right_end_not_the_left(self):
+        state, T = _kong_scenario(wall=[man(9), man(8), man(7)])
+        after_discard = apply_action(state, {"type": "discard", "tile": T})
+        claimed = apply_action(after_discard, {"type": "kong"})
+
+        assert claimed.wall == [man(9), man(8)]  # last element popped, front untouched
+        assert len(claimed.wall) == len(after_discard.wall) - 1
+
+    def test_kong_is_still_offered_when_the_wall_is_empty(self):
+        # Empty wall does NOT suppress the kong claim -- it's still a
+        # legal option, alongside pung, even though it will gain nothing.
+        state, T = _kong_scenario(wall=[])
+        after_discard = apply_action(state, {"type": "discard", "tile": T})
+
+        assert after_discard.pending_claims == [
+            {"seat": 2, "type": "pung"},
+            {"seat": 2, "type": "kong"},
+        ]
+        assert legal_actions(after_discard) == [
+            {"type": "pung"}, {"type": "kong"}, {"type": "pass"},
+        ]
+
+    def test_konging_with_an_empty_wall_draws_no_replacement_without_crashing(self):
+        state, T = _kong_scenario(wall=[])
+        after_discard = apply_action(state, {"type": "discard", "tile": T})
+        claimed = apply_action(after_discard, {"type": "kong"})
+
+        assert claimed.wall == []  # still empty -- nothing to pop, no crash
+        assert claimed.melds[2] == [{"tiles": [T, T, T, T], "concealed": False}]
+        assert claimed.hands[2].count(T) == 0
+        # 13 concealed -> 10 after the 3 kong tiles leave, no replacement
+        # arrives to bring it back up.
+        assert len(claimed.hands[2]) == 10
+        assert claimed.phase == "awaiting_meld_discard"
+        assert claimed.status == "in_progress"
+
+    def test_konging_with_an_empty_wall_then_discarding_reaches_exhaustion(self):
+        state, T = _kong_scenario(wall=[])
+        after_discard = apply_action(state, {"type": "discard", "tile": T})
+        claimed = apply_action(after_discard, {"type": "kong"})
+
+        # Discard a tile nobody else can claim, to isolate the exhaustion
+        # check itself (mirrors the drained-wall test below).
+        discard_tile = sou(9)
+        assert discard_tile in claimed.hands[2]
+        final_state = apply_action(claimed, {"type": "discard", "tile": discard_tile})
+
+        assert final_state.status == "wall_exhausted"
+        assert len(final_state.wall) == 0
+        assert final_state.winner is None
+
+    def test_claimer_discards_next_without_a_separate_draw(self):
+        state, T = _kong_scenario()
+        after_discard = apply_action(state, {"type": "discard", "tile": T})
+        claimed = apply_action(after_discard, {"type": "kong"})
+
+        actions = legal_actions(claimed)
+        assert {"type": "draw"} not in actions
+        assert all(a["type"] == "discard" for a in actions)  # no declare_win off a kong
+
+        tile_to_discard = claimed.hands[2][0]
+        discarded = apply_action(claimed, {"type": "discard", "tile": tile_to_discard})
+        assert len(discarded.hands[2]) == len(claimed.hands[2]) - 1
+        assert discarded.discards[2] == [tile_to_discard]
+
+    def test_tile_conservation_holds_across_a_kong_claim(self):
+        state, T = _kong_scenario(wall=[man(9), man(8), man(7)])
+        baseline = total_tiles_in_play(state)
+        after_discard = apply_action(state, {"type": "discard", "tile": T})
+        assert total_tiles_in_play(after_discard) == baseline
+        claimed = apply_action(after_discard, {"type": "kong"})
+        assert total_tiles_in_play(claimed) == baseline
+        tile_to_discard = claimed.hands[2][0]
+        discarded = apply_action(claimed, {"type": "discard", "tile": tile_to_discard})
+        assert total_tiles_in_play(discarded) == baseline
+
+    def test_kong_claim_does_not_mutate_the_parent_state(self):
+        state, T = _kong_scenario(wall=[man(9), man(8), man(7)])
+        after_discard = apply_action(state, {"type": "discard", "tile": T})
+        original_wall = list(after_discard.wall)
+        original_seat2_hand = list(after_discard.hands[2])
+
+        claimed = apply_action(after_discard, {"type": "kong"})
+        claimed.wall.append(999)
+        claimed.hands[2].append(999)
+        claimed.melds[2][0]["tiles"].append(999)
+
+        assert after_discard.wall == original_wall
+        assert after_discard.hands[2] == original_seat2_hand
+        assert after_discard.melds[2] == []
+
+    def test_wall_exhaustion_when_a_kong_replacement_drains_the_wall(self):
+        # Wall has exactly one tile left. Claiming kong takes it as the
+        # replacement (from the back, but it's the only tile so also the
+        # front -- this is "front meets back"), leaving the wall empty.
+        # The claimer still gets to discard normally; wall_exhausted is
+        # only detected once that discard resolves with no further claims.
+        state, T = _kong_scenario(wall=[man(9)])
+        after_discard = apply_action(state, {"type": "discard", "tile": T})
+        claimed = apply_action(after_discard, {"type": "kong"})
+
+        assert claimed.wall == []
+        assert claimed.status == "in_progress"  # not exhausted mid-claim
+
+        # seat 2's hand after the kong: original 13, minus 3 (kong) plus 1
+        # (replacement man(9)) = 11 tiles, ending in [..., man(9)].
+        assert man(9) in claimed.hands[2]
+
+        # Discard a tile nobody else can claim, to isolate the exhaustion
+        # check itself.
+        discard_tile = sou(9)
+        assert discard_tile in claimed.hands[2]
+        final_state = apply_action(claimed, {"type": "discard", "tile": discard_tile})
+
+        assert final_state.status == "wall_exhausted"
+        assert len(final_state.wall) == 0
+        assert final_state.winner is None
+
+    def test_declining_pung_and_kong_together_clears_both_and_preserves_a_different_seats_chow(self):
+        # A manually-built queue (like TestChow's analogous test): seat 2
+        # has both a pung and a kong entry (the SAME seat, two DIFFERENT
+        # types), and seat 3 has an unrelated chow entry after them. This
+        # is the decisive test for grouping-by-tier: a type-only filter
+        # would treat pung and kong as two separate decisions and only
+        # drop the front one (pung), leaving kong still offered to seat 2
+        # -- wrong, since declining the pair means declining both at once.
+        state = GameState(
+            wall=[man(9), man(8)],
+            hands=[
+                [man(1), man(2), man(3), pin(1), pin(2), pin(3),
+                 pin(4), pin(5), pin(6), pin(7), pin(8), pin(9), sou(1), sou(2)],
+                [sou(3), sou(4), sou(5), sou(6), sou(7), sou(8), sou(9),
+                 EAST, EAST, SOUTH, WEST, NORTH, RED_DRAGON],
+                [pin(4), pin(4), pin(4), sou(1), sou(1), man(4), man(5),
+                 man(6), man(7), man(8), man(9), GREEN_DRAGON, WHITE_DRAGON],
+                [pin(5), pin(6), man(1), man(2), man(3), man(6), man(7),
+                 man(8), sou(2), sou(3), sou(4), GREEN_DRAGON, WHITE_DRAGON],
+            ],
+            melds=[[], [], [], []],
+            discards=[[], [], [], []],
+            current_turn=2,
+            phase="awaiting_claim_decision",
+            status="in_progress",
+            winner=None,
+            dealer=0,
+            round_wind=EAST,
+            seat_winds=[EAST, SOUTH, WEST, NORTH],
+            last_discard=pin(4),
+            last_discarder=0,
+            pending_claims=[
+                {"seat": 2, "type": "pung"},
+                {"seat": 2, "type": "kong"},
+                {"seat": 3, "type": "chow", "tiles": (pin(4), pin(5), pin(6))},
+            ],
+        )
+
+        assert legal_actions(state) == [
+            {"type": "pung"}, {"type": "kong"}, {"type": "pass"},
+        ]
+
+        after_pass = apply_action(state, {"type": "pass"})
+
+        # Both pung and kong gone in ONE pass -- seat 2 is never asked
+        # about kong separately after declining pung.
+        assert after_pass.pending_claims == [
+            {"seat": 3, "type": "chow", "tiles": (pin(4), pin(5), pin(6))},
+        ]
+        assert after_pass.current_turn == 3
+        assert after_pass.phase == "awaiting_claim_decision"
+        assert legal_actions(after_pass) == [
+            {"type": "chow", "tiles": (pin(4), pin(5), pin(6))},
+            {"type": "pass"},
+        ]
+
+
+# --- concealed kong (暗槓), self-declared on your own turn ------------------
+
+def _concealed_kong_scenario(wall=None):
+    """Seat 0's own turn, no prior melds. Holds 4 copies of T among 14
+    tiles; the rest is a deliberately non-winning filler shape, to isolate
+    basic mechanics from 槓上開花 win detection."""
+    T = man(5)
+    hand = [T, T, T, T, man(1), man(2), man(3),
+            pin(6), pin(7), pin(8), sou(1), sou(2), EAST, WEST]
+    filler13 = [man(9), man(9), pin(1), pin(1), sou(9), sou(9),
+                RED_DRAGON, RED_DRAGON, GREEN_DRAGON, GREEN_DRAGON,
+                WHITE_DRAGON, NORTH, NORTH]
+    state = GameState(
+        wall=wall if wall is not None else [man(9), man(8), man(7)],
+        hands=[hand, list(filler13), list(filler13), list(filler13)],
+        melds=[[], [], [], []],
+        discards=[[], [], [], []],
+        current_turn=0,
+        phase="awaiting_discard",
+        status="in_progress",
+        winner=None,
+        dealer=0,
+        round_wind=EAST,
+        seat_winds=[EAST, SOUTH, WEST, NORTH],
+        last_discard=None,
+        last_discarder=None,
+    )
+    return state, T
+
+
+class TestConcealedKong:
+    def test_offered_when_hand_holds_four_of_a_kind(self):
+        state, T = _concealed_kong_scenario()
+        assert {"type": "concealed_kong", "tile": T} in legal_actions(state)
+
+    def test_not_offered_with_only_three_copies(self):
+        state, T = _concealed_kong_scenario()
+        state.hands[0] = list(state.hands[0])
+        state.hands[0].remove(T)  # down to 3 copies
+        actions = legal_actions(state)
+        assert {"type": "concealed_kong", "tile": T} not in actions
+        assert all(a["type"] != "concealed_kong" for a in actions)
+
+    def test_not_offered_during_a_forced_meld_discard(self):
+        # Scope decision: concealed/added kong may only be declared right
+        # after drawing on your own turn, not in the forced discard that
+        # follows claiming a meld from someone else's discard -- even if
+        # the remaining hand happens to hold 4 of an unrelated tile.
+        T = man(5)
+        hand = [T, T, T, T, man(1), man(2), man(3),
+                pin(6), pin(7), pin(8), sou(1), sou(2), NORTH]
+        filler13 = [man(9), man(9), pin(1), pin(1), sou(9), sou(9),
+                    RED_DRAGON, RED_DRAGON, GREEN_DRAGON, GREEN_DRAGON,
+                    WHITE_DRAGON, NORTH, EAST]
+        state = GameState(
+            wall=[man(9), man(8)],
+            hands=[hand, list(filler13), list(filler13), list(filler13)],
+            melds=[[{"tiles": [SOUTH, SOUTH, SOUTH], "concealed": False}], [], [], []],
+            discards=[[], [], [], []],
+            current_turn=0,
+            phase="awaiting_meld_discard",
+            status="in_progress",
+            winner=None,
+            dealer=0,
+            round_wind=EAST,
+            seat_winds=[EAST, SOUTH, WEST, NORTH],
+            last_discard=None,
+            last_discarder=None,
+        )
+        actions = legal_actions(state)
+        assert all(a["type"] not in ("concealed_kong", "added_kong") for a in actions)
+
+    def test_declaring_forms_concealed_meld_and_draws_replacement_from_the_back(self):
+        state, T = _concealed_kong_scenario(wall=[man(9), man(8), man(7)])
+        result = apply_action(state, {"type": "concealed_kong", "tile": T})
+
+        assert result.melds[0] == [{"tiles": [T, T, T, T], "concealed": True}]
+        assert result.hands[0].count(T) == 0
+        assert man(7) in result.hands[0]  # replacement is wall[-1], not wall[0]
+        assert man(9) not in result.hands[0]
+        assert result.wall == [man(9), man(8)]  # popped from the back
+        assert result.current_turn == 0  # still their own turn
+        assert result.phase == "awaiting_discard"  # NOT awaiting_meld_discard
+
+    def test_meld_is_flagged_concealed_unlike_an_exposed_kong(self):
+        # The whole reason melds became {'tiles', 'concealed'} dicts:
+        # exposed and concealed kong are both 4 physical tiles and are
+        # only distinguishable by this flag.
+        state, T = _concealed_kong_scenario(wall=[man(9), man(8), man(7)])
+        result = apply_action(state, {"type": "concealed_kong", "tile": T})
+        assert result.melds[0][0]["concealed"] is True
+
+        exposed_state, exposed_T = _kong_scenario(wall=[man(9), man(8), man(7)])
+        exposed_after_discard = apply_action(exposed_state, {"type": "discard", "tile": exposed_T})
+        exposed_result = apply_action(exposed_after_discard, {"type": "kong"})
+        assert exposed_result.melds[2][0]["concealed"] is False
+
+    def test_win_on_replacement_is_reachable_even_with_an_existing_exposed_meld(self):
+        # 槓上開花, and specifically exercises the win-check combining the
+        # concealed hand with an ALREADY-existing exposed meld (the
+        # is_winning_hand(hand) bug this task's design surfaced: that
+        # function requires exactly 14 tiles, but a player with any prior
+        # meld never has 14 concealed tiles).
+        T = man(9)
+        hand = [T, T, T, T, man(1), man(2), man(3),
+                man(4), man(5), man(6), pin(5)]
+        assert len(hand) == 11  # 14 - 3 for the existing exposed pung
+        state = GameState(
+            wall=[man(8), pin(5)],  # replacement (back) completes the pair
+            hands=[hand, [man(1)] * 13, [man(1)] * 13, [man(1)] * 13],
+            melds=[[{"tiles": [EAST, EAST, EAST], "concealed": False}], [], [], []],
+            discards=[[], [], [], []],
+            current_turn=0,
+            phase="awaiting_discard",
+            status="in_progress",
+            winner=None,
+            dealer=0,
+            round_wind=EAST,
+            seat_winds=[EAST, SOUTH, WEST, NORTH],
+            last_discard=None,
+            last_discarder=None,
+        )
+        after_kong = apply_action(state, {"type": "concealed_kong", "tile": T})
+        assert {"type": "declare_win"} in legal_actions(after_kong)
+
+        won = apply_action(after_kong, {"type": "declare_win"})
+        assert won.status == "self_draw_win"
+        assert won.winner == 0
+
+    def test_tile_conservation_holds_across_a_concealed_kong(self):
+        state, T = _concealed_kong_scenario(wall=[man(9), man(8), man(7)])
+        baseline = total_tiles_in_play(state)
+        result = apply_action(state, {"type": "concealed_kong", "tile": T})
+        assert total_tiles_in_play(result) == baseline
+        tile_to_discard = result.hands[0][0]
+        discarded = apply_action(result, {"type": "discard", "tile": tile_to_discard})
+        assert total_tiles_in_play(discarded) == baseline
+
+    def test_does_not_mutate_the_parent_state(self):
+        state, T = _concealed_kong_scenario(wall=[man(9), man(8), man(7)])
+        original_wall = list(state.wall)
+        original_hand = list(state.hands[0])
+
+        result = apply_action(state, {"type": "concealed_kong", "tile": T})
+        result.wall.append(999)
+        result.hands[0].append(999)
+        result.melds[0][0]["tiles"].append(999)
+
+        assert state.wall == original_wall
+        assert state.hands[0] == original_hand
+        assert state.melds[0] == []
+
+    def test_empty_wall_draws_no_replacement_without_crashing(self):
+        state, T = _concealed_kong_scenario(wall=[])
+        result = apply_action(state, {"type": "concealed_kong", "tile": T})
+
+        assert result.wall == []
+        assert result.melds[0] == [{"tiles": [T, T, T, T], "concealed": True}]
+        assert len(result.hands[0]) == 10  # 14 - 4, no replacement arrives
+        assert result.phase == "awaiting_discard"
+        assert result.status == "in_progress"
+
+
+# --- added kong (加槓), upgrading your own existing exposed pung ------------
+
+def _added_kong_scenario(wall=None):
+    """Seat 0's own turn. Already has an exposed pung of V; hand holds the
+    4th copy plus a deliberately non-winning filler shape."""
+    V = man(1)
+    hand = [V, man(2), man(3), man(4), man(6), man(7), man(8),
+            pin(1), pin(2), pin(3), sou(6), sou(7), EAST]
+    filler13 = [man(9), man(9), pin(1), pin(1), sou(9), sou(9),
+                RED_DRAGON, RED_DRAGON, GREEN_DRAGON, GREEN_DRAGON,
+                WHITE_DRAGON, NORTH, NORTH]
+    state = GameState(
+        wall=wall if wall is not None else [man(9), man(8), man(7)],
+        hands=[hand, list(filler13), list(filler13), list(filler13)],
+        melds=[[{"tiles": [V, V, V], "concealed": False}], [], [], []],
+        discards=[[], [], [], []],
+        current_turn=0,
+        phase="awaiting_discard",
+        status="in_progress",
+        winner=None,
+        dealer=0,
+        round_wind=EAST,
+        seat_winds=[EAST, SOUTH, WEST, NORTH],
+        last_discard=None,
+        last_discarder=None,
+    )
+    return state, V
+
+
+class TestAddedKong:
+    def test_offered_when_hand_holds_the_fourth_tile_of_an_existing_exposed_pung(self):
+        state, V = _added_kong_scenario()
+        assert {"type": "added_kong", "tile": V} in legal_actions(state)
+
+    def test_not_offered_without_a_matching_exposed_pung(self):
+        state, V = _added_kong_scenario()
+        state.melds[0] = []  # no exposed pung of V to upgrade
+        actions = legal_actions(state)
+        assert {"type": "added_kong", "tile": V} not in actions
+
+    def test_not_offered_if_the_pung_exists_but_hand_lacks_the_fourth_tile(self):
+        state, V = _added_kong_scenario()
+        state.hands[0] = list(state.hands[0])
+        state.hands[0].remove(V)
+        actions = legal_actions(state)
+        assert {"type": "added_kong", "tile": V} not in actions
+
+    def test_not_offered_during_a_forced_meld_discard(self):
+        state, _V = _added_kong_scenario()
+        state.phase = "awaiting_meld_discard"
+        actions = legal_actions(state)
+        assert all(a["type"] not in ("concealed_kong", "added_kong") for a in actions)
+
+    def test_declaring_upgrades_the_existing_meld_in_place(self):
+        state, V = _added_kong_scenario(wall=[man(9), man(8), man(7)])
+        result = apply_action(state, {"type": "added_kong", "tile": V})
+
+        # Still exactly one meld entry for seat 0 -- upgraded, not duplicated.
+        assert result.melds[0] == [{"tiles": [V, V, V, V], "concealed": False}]
+        assert result.hands[0].count(V) == 0
+        assert man(7) in result.hands[0]  # replacement is wall[-1]
+        assert man(9) not in result.hands[0]
+        assert result.wall == [man(9), man(8)]
+        assert result.current_turn == 0
+        assert result.phase == "awaiting_discard"
+
+    def test_win_on_replacement_is_reachable(self):
+        # 槓上開花 off an added kong.
+        V = man(1)
+        hand = [V, man(2), man(3), man(4), man(5), man(6), man(7),
+                sou(1), sou(2), sou(3), pin(5)]
+        assert len(hand) == 11  # 14 - 3 for the existing exposed pung
+        state = GameState(
+            wall=[man(8), pin(5)],  # replacement (back) completes the pair
+            hands=[hand, [man(9)] * 13, [man(9)] * 13, [man(9)] * 13],
+            melds=[[{"tiles": [V, V, V], "concealed": False}], [], [], []],
+            discards=[[], [], [], []],
+            current_turn=0,
+            phase="awaiting_discard",
+            status="in_progress",
+            winner=None,
+            dealer=0,
+            round_wind=EAST,
+            seat_winds=[EAST, SOUTH, WEST, NORTH],
+            last_discard=None,
+            last_discarder=None,
+        )
+        after_kong = apply_action(state, {"type": "added_kong", "tile": V})
+        assert {"type": "declare_win"} in legal_actions(after_kong)
+
+        won = apply_action(after_kong, {"type": "declare_win"})
+        assert won.status == "self_draw_win"
+        assert won.winner == 0
+
+    def test_tile_conservation_holds_across_an_added_kong(self):
+        state, V = _added_kong_scenario(wall=[man(9), man(8), man(7)])
+        baseline = total_tiles_in_play(state)
+        result = apply_action(state, {"type": "added_kong", "tile": V})
+        assert total_tiles_in_play(result) == baseline
+        tile_to_discard = result.hands[0][0]
+        discarded = apply_action(result, {"type": "discard", "tile": tile_to_discard})
+        assert total_tiles_in_play(discarded) == baseline
+
+    def test_does_not_mutate_the_parent_state(self):
+        state, V = _added_kong_scenario(wall=[man(9), man(8), man(7)])
+        original_wall = list(state.wall)
+        original_hand = list(state.hands[0])
+        original_meld_tiles = list(state.melds[0][0]["tiles"])
+
+        result = apply_action(state, {"type": "added_kong", "tile": V})
+        result.wall.append(999)
+        result.hands[0].append(999)
+        result.melds[0][0]["tiles"].append(999)
+
+        assert state.wall == original_wall
+        assert state.hands[0] == original_hand
+        assert state.melds[0][0]["tiles"] == original_meld_tiles
+
+    def test_empty_wall_draws_no_replacement_without_crashing(self):
+        state, V = _added_kong_scenario(wall=[])
+        result = apply_action(state, {"type": "added_kong", "tile": V})
+
+        assert result.wall == []
+        assert result.melds[0] == [{"tiles": [V, V, V, V], "concealed": False}]
+        assert len(result.hands[0]) == 12  # 13 - 1 given up, no replacement arrives
+        assert result.phase == "awaiting_discard"
+        assert result.status == "in_progress"
+
+
 class TestClaimQueueGeneralizes:
-    """discard_win/pung/chow are real now, but kong (also pung-tier) still
-    isn't. These tests drive the queue mechanics directly with a
-    hand-built, multi-entry pending_claims (including a made-up
-    'future_claim' type standing in for kong), to prove the offer/accept/
-    pass machinery itself -- not just any one claim type's correctness --
-    already handles more than one outstanding tier on the same discard
-    without any further rework."""
+    """discard_win/pung/chow/exposed-kong are real now, but concealed kong,
+    added kong, and 搶槓 aren't. These tests drive the queue mechanics
+    directly with a hand-built, multi-entry pending_claims (including a
+    made-up 'future_claim' type standing in for one of those), to prove
+    the offer/accept/pass machinery itself -- not just any one claim
+    type's correctness -- already handles more than one outstanding tier
+    on the same discard without any further rework."""
 
     def _two_claim_state(self):
         return GameState(
