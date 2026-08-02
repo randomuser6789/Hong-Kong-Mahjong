@@ -3,11 +3,10 @@ tests/test_game.py's module docstring for the full design writeup.
 
 Scope of this phase: build/shuffle/deal, draw, discard, discard-win (食糊)
 claims, pung (碰) claims, exposed kong (明槓) claims, chow (上) claims,
-concealed kong (暗槓), added kong (加槓), self-draw win detection, wall
-exhaustion (流局). No 搶槓 (robbing an added kong) yet -- see
-_promote_pung_to_kong for exactly where that would slot in. No fan/scoring
-gate (a win only needs structural validity via is_winning_hand, exactly
-like self-draw).
+concealed kong (暗槓), added kong (加槓), robbing the kong (搶槓, added kong
+only -- never concealed), self-draw win detection, wall exhaustion (流局).
+No fan/scoring gate (a win only needs structural validity via
+is_winning_hand, exactly like self-draw).
 
 Claim window shape: a discard always gathers ALL eligible claims across
 ALL seats into `pending_claims`, an ordered-by-priority list of entries
@@ -85,8 +84,12 @@ EAST, SOUTH, WEST, NORTH = 27, 28, 29, 30
 WINDS_IN_TURN_ORDER = [EAST, SOUTH, WEST, NORTH]
 
 # Priority tier per claim type (RULES.md section 7: win > pung/kong > chow).
-# Grouping key for pending_claims -- see the module docstring.
-_TIER = {"discard_win": 0, "pung": 1, "kong": 1, "chow": 2}
+# Grouping key for pending_claims -- see the module docstring. 'rob_kong'
+# shares the win tier (robbing pre-empts the kong from completing at all),
+# though a rob-kong window is always its own isolated single-entry queue in
+# practice, so the tier match is conceptual more than mechanically load-
+# bearing here.
+_TIER = {"discard_win": 0, "pung": 1, "kong": 1, "chow": 2, "rob_kong": 0}
 
 
 @dataclass
@@ -354,6 +357,45 @@ def _promote_pung_to_kong(melds, seat, tile):
             return
 
 
+def _finalize_added_kong(state, hands, discards, seat, tile):
+    """Complete an added kong that was NOT robbed: reclaim the tile off
+    the (momentary) discard pile, promote the meld, and draw the
+    replacement. Shared by 'added_kong' (when nobody can rob) and 'pass'
+    (when the rob was declined) -- both routes must land on the identical
+    resulting state shape, since either way this is still the declaring
+    seat's own turn afterward (declare_win checked again, same as
+    'concealed_kong'). `hands`/`discards` are passed explicitly (rather
+    than always reading state.*) because the 'added_kong' caller already
+    has freshly-computed arrays (tile removed from hand, appended to
+    discards) that haven't been stored into a GameState yet."""
+    new_hands = _clone_lists(hands)
+    new_discards = _clone_lists(discards)
+    new_discards[seat].pop()  # reclaim the momentarily-exposed tile
+
+    new_melds = _clone_melds(state.melds)
+    _promote_pung_to_kong(new_melds, seat, tile)
+
+    new_wall = list(state.wall)
+    _draw_kong_replacement(new_wall, new_hands[seat])
+
+    return GameState(
+        wall=new_wall,
+        hands=new_hands,
+        melds=new_melds,
+        discards=new_discards,
+        current_turn=seat,
+        phase="awaiting_discard",
+        status=state.status,
+        winner=state.winner,
+        dealer=state.dealer,
+        round_wind=state.round_wind,
+        seat_winds=list(state.seat_winds),
+        last_discard=None,
+        last_discarder=None,
+        pending_claims=[],
+    )
+
+
 def apply_action(state, action):
     action_type = action["type"]
 
@@ -595,34 +637,81 @@ def apply_action(state, action):
         new_hands = _clone_lists(state.hands)
         new_hands[seat].remove(tile)
 
-        # Distinct step (see _promote_pung_to_kong) -- this is where a
-        # future 搶槓 check would go, between the hand removal above and
-        # the promotion below.
-        new_melds = _clone_melds(state.melds)
-        _promote_pung_to_kong(new_melds, seat, tile)
+        # The tile is momentarily "exposed" on the discard pile -- exactly
+        # like a real discard visually, and exactly why it's robbable at
+        # all -- so it's accounted for somewhere (not floating outside
+        # hands/melds/discards/wall) while the rob decision is pending.
+        new_discards = _clone_lists(state.discards)
+        new_discards[seat].append(tile)
 
-        new_wall = list(state.wall)
-        _draw_kong_replacement(new_wall, new_hands[seat])
+        # 搶槓 branch point (see _promote_pung_to_kong): before finalizing
+        # the promotion, check whether any OTHER seat can rob this exposed
+        # tile for a win. Reuses the exact same eligibility/tiebreak logic
+        # as a real discard win -- 一炮多響 rules out more than one robber.
+        robber = _find_discard_win_seat(new_hands, seat, tile)
+        if robber is not None:
+            return GameState(
+                wall=list(state.wall),
+                hands=new_hands,
+                melds=_clone_melds(state.melds),  # NOT promoted -- stays a 3-tile pung
+                discards=new_discards,
+                current_turn=robber,
+                phase="awaiting_claim_decision",
+                status=state.status,
+                winner=state.winner,
+                dealer=state.dealer,
+                round_wind=state.round_wind,
+                seat_winds=list(state.seat_winds),
+                last_discard=tile,
+                last_discarder=seat,
+                pending_claims=[{"seat": robber, "type": "rob_kong"}],
+            )
+
+        return _finalize_added_kong(state, new_hands, new_discards, seat, tile)
+
+    if action_type == "rob_kong":
+        robber = state.current_turn
+        tile = state.last_discard
+        declarer = state.last_discarder
+        # The promoter's exposed pung simply stays a pung forever -- the
+        # kong never happened, so melds are untouched.
+
+        new_discards = _clone_lists(state.discards)
+        new_discards[declarer].pop()  # reclaim the momentarily-exposed tile...
+
+        new_hands = _clone_lists(state.hands)
+        new_hands[robber].append(tile)  # ...it goes to the robber instead
 
         return GameState(
-            wall=new_wall,
+            wall=list(state.wall),
             hands=new_hands,
-            melds=new_melds,
-            discards=_clone_lists(state.discards),
-            current_turn=seat,
-            phase="awaiting_discard",  # still their own turn -- declare_win checked again
-            status=state.status,
-            winner=state.winner,
+            melds=_clone_melds(state.melds),
+            discards=new_discards,
+            current_turn=robber,
+            phase=state.phase,
+            status="kong_robbed",
+            winner=robber,
             dealer=state.dealer,
             round_wind=state.round_wind,
             seat_winds=list(state.seat_winds),
-            last_discard=state.last_discard,
-            last_discarder=state.last_discarder,
-            pending_claims=_clone_claims(state.pending_claims),
+            last_discard=None,
+            last_discarder=None,
+            pending_claims=[],
         )
 
     if action_type == "pass":
         front = state.pending_claims[0]
+        if front["type"] == "rob_kong":
+            # Declined the rob -- the added kong completes normally. The
+            # tile was already removed from the declaring seat's hand and
+            # placed on their discard pile when the kong was declared (see
+            # 'added_kong' above), so this is exactly the same
+            # finalization that branch's no-robber path
+            # uses.
+            return _finalize_added_kong(
+                state, state.hands, state.discards, state.last_discarder, state.last_discard
+            )
+
         front_tier = _tier_of(front["type"])
         remaining = [
             claim for claim in state.pending_claims

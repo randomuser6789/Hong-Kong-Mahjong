@@ -34,25 +34,54 @@ Target API (not yet implemented): mahjong/game.py
                                     'awaiting_claim_decision' |
                                     'awaiting_meld_discard'
         status: str                'in_progress' | 'self_draw_win' |
-                                    'discard_win' | 'wall_exhausted'
+                                    'discard_win' | 'kong_robbed' |
+                                    'wall_exhausted'
         winner: int | None         seat index that won, else None
         dealer: int                seat index of the dealer
         round_wind: int            tile code 27-30
         seat_winds: list[int]      each seat's wind, tile code 27-30
-        last_discard: int | None   tile under contest by pending_claims, else None
-        last_discarder: int | None seat who discarded it, else None
+        last_discard: int | None   tile under contest by pending_claims, else
+                                    None -- this is also how a pending 搶槓
+                                    (rob-the-kong) window tracks the tile
+                                    being added to an exposed pung: it isn't
+                                    really a "discard" in that case (it never
+                                    touches anyone's discard pile), but the
+                                    field's job -- "which tile is currently
+                                    up for grabs" -- is identical, so it's
+                                    reused rather than adding a parallel field.
+        last_discarder: int | None seat who discarded it, else None -- for a
+                                    rob-the-kong window, this is the seat
+                                    who DECLARED the added kong (the seat
+                                    that would otherwise finalize it).
         pending_claims: list[dict] ordered-by-priority queue of entries
                                     still outstanding on last_discard, only
                                     populated when phase ==
                                     'awaiting_claim_decision'. Each entry is
                                     {'seat': int, 'type': 'discard_win' |
-                                    'pung' | 'kong' | 'chow'}; chow entries
-                                    have an extra 'tiles': (a, b, c) -- the
-                                    sorted 3-tile run this specific chow
-                                    option would form (see below).
+                                    'pung' | 'kong' | 'chow' | 'rob_kong'};
+                                    chow entries have an extra 'tiles':
+                                    (a, b, c) -- the sorted 3-tile run this
+                                    specific chow option would form (see
+                                    below). A 'rob_kong' window (see
+                                    apply_action's 'added_kong' below) is
+                                    always exactly [{'seat': s, 'type':
+                                    'rob_kong'}] or doesn't open at all --
+                                    it is never mixed with pung/chow entries
+                                    (nothing is actually being discarded, so
+                                    no pung/chow claim could ever apply),
+                                    and 一炮多響 rules out more than one seat.
 
                                     Priority order is win > pung/kong > chow
-                                    (RULES.md section 7). Entries are
+                                    (RULES.md section 7); 'rob_kong' shares
+                                    the win tier ("robbing wins at win-tier
+                                    priority (beats the kong)"), though in
+                                    practice it never needs to out-rank
+                                    anything else in the SAME queue, since a
+                                    rob-kong window is always its own
+                                    isolated queue (see above) -- the tier
+                                    match matters conceptually (robbing
+                                    pre-empts the kong from completing at
+                                    all) more than mechanically. Entries are
                                     grouped into GROUPS by (seat, TIER), in
                                     priority order -- that's the true unit
                                     of "one decision": all entries a single
@@ -147,13 +176,13 @@ Target API (not yet implemented): mahjong/game.py
         front GROUP of pending_claims (every entry sharing both
         pending_claims[0]['seat'] and pending_claims[0]'s priority tier --
         NOT necessarily its exact type; see the field docs above) --
-        {'type': 'discard_win'}, {'type': 'pung'}, and/or {'type': 'kong'}
-        (a 3-holder sees BOTH pung and kong here together, never just
-        one), or one {'type': 'chow', 'tiles': (a, b, c)} per distinct
-        chow entry in that group -- plus
+        {'type': 'discard_win'}, {'type': 'pung'}, {'type': 'kong'}, or
+        {'type': 'rob_kong'} (a 3-holder sees BOTH pung and kong here
+        together, never just one; 'rob_kong' only ever appears alone --
+        see the pending_claims field docs above), or one {'type': 'chow',
+        'tiles': (a, b, c)} per distinct chow entry in that group -- plus
         {'type': 'pass'}. The type/shape is derived from the queue, never
-        hardcoded, so concealed/added kong slot in later without changing
-        this function.
+        hardcoded.
         If phase == 'awaiting_discard': one {'type': 'discard', 'tile': t}
         per DISTINCT tile value in the current player's hand (sorted); plus
         {'type': 'concealed_kong', 'tile': t} for each DISTINCT tile the
@@ -282,32 +311,67 @@ Target API (not yet implemented): mahjong/game.py
             where melds[current_turn] contains an existing {'tiles':
             [t,t,t], 'concealed': False} entry AND the hand holds >=1 more
             copy of t -- this is 加槓): removes ONE copy of t from the
-            hand and appends it to that SAME existing meld dict's 'tiles'
-            in place (3 -> 4 tiles; 'concealed' stays False -- an added
-            kong is still exposed, since it started as an exposed pung).
-            No new meld entry is created. Same replacement-draw and
-            current_turn/phase-unchanged behavior as 'concealed_kong'
-            (declare_win checked again immediately after, for the same
-            槓上開花 reason). Robbing this kong (搶槓) is not implemented
-            yet -- declaring one never opens a claim window for other
-            seats here, though real rules allow it for added kong
-            specifically (never for concealed kong).
-        'pass' (only legal in 'awaiting_claim_decision'): drops the ENTIRE
-            front GROUP -- every entry sharing both pending_claims[0]['seat']
-            and pending_claims[0]'s priority tier -- not just entry [0].
-            (Grouping by (seat, tier) rather than type alone is what lets
-            a 3-holder's pung and kong entries drop together as one
-            declined decision,
-            and what stays correct if a future rule ever let one type apply
-            to two seats at once; see the pending_claims field docs above.)
-            E.g. declining a chow declines all its variants at once, and
-            declining a pung+kong group declines both, since each is really
-            one decision ("do you want to claim this at all") with multiple
-            options. If claims remain, offers the next group: current_turn
-            -> that group's seat, phase stays 'awaiting_claim_decision'. If
-            none remain, resolves exactly like the "otherwise" branch of
-            'discard' above, using last_discarder as the reference seat;
-            last_discard/last_discarder -> None.
+            hand. Then checks whether any OTHER seat's hand + t is
+            currently a valid winning hand (the exact same check
+            _find_discard_win_seat uses for a real discard, including its
+            seat-order tiebreak -- 一炮多響 rules out more than one robber
+            here too):
+                - if a robber exists (搶槓 window): the meld is NOT
+                  promoted (stays a 3-tile pung) and NO replacement is
+                  drawn. phase -> 'awaiting_claim_decision', current_turn
+                  -> the robber, pending_claims -> [{'seat': robber,
+                  'type': 'rob_kong'}], last_discard -> t, last_discarder
+                  -> the declaring seat (see the field docs above for why
+                  these fields, not new ones).
+                - otherwise: appends t to that SAME existing meld dict's
+                  'tiles' in place (3 -> 4 tiles; 'concealed' stays False
+                  -- an added kong is still exposed) via
+                  _promote_pung_to_kong -- a deliberately separate,
+                  named step from the hand-tile removal and the
+                  rob-eligibility check above it, so this is the exact
+                  branch point 搶槓 needed and now uses. No new meld entry
+                  is created. Then, IF THE WALL IS NON-EMPTY, draws ONE
+                  replacement tile from wall[-1]. current_turn and phase
+                  are both unchanged ('awaiting_discard' ->
+                  'awaiting_discard') -- declare_win is checked again
+                  immediately after, which is what makes 槓上開花
+                  reachable off an (unrobbed) added kong.
+            Robbing only ever applies to ADDED kong -- 'concealed_kong'
+            above has no such check at all, matching real rules (a
+            concealed kong is never robbable).
+        'rob_kong' (only legal when the front group's type is
+            'rob_kong'): the tile (last_discard) joins the robbing seat's
+            hand (matching 'discard_win': the promoter's exposed pung
+            simply stays a pung forever -- the kong never happened).
+            status -> 'kong_robbed', winner -> current_turn (the robber).
+            last_discard/last_discarder -> None, pending_claims -> [].
+        'pass' (only legal in 'awaiting_claim_decision'): if the front
+            group's type is 'rob_kong' (there is only ever this one entry
+            in that case -- see the field docs above), the decline
+            finalizes the added kong that was waiting on this decision:
+            promotes last_discarder's pung-of-last_discard via
+            _promote_pung_to_kong, draws the replacement from wall[-1] if
+            non-empty, current_turn -> last_discarder, phase ->
+            'awaiting_discard' (declare_win checked again, same as the
+            no-robber-existed path above -- both routes to a completed
+            added kong end up in the identical state shape).
+            Otherwise (normal discard-claim queue): drops the ENTIRE
+            front GROUP -- every entry sharing both
+            pending_claims[0]['seat'] and pending_claims[0]'s priority
+            tier -- not just entry [0]. (Grouping by (seat, tier) rather
+            than type alone is what lets a 3-holder's pung and kong
+            entries drop together as one declined decision, and what
+            stays correct if a future rule ever let one type apply to two
+            seats at once; see the pending_claims field docs above.) E.g.
+            declining a chow declines all its variants at once, and
+            declining a pung+kong group declines both, since each is
+            really one decision ("do you want to claim this at all")
+            with multiple options. If claims remain, offers the next
+            group: current_turn -> that group's seat, phase stays
+            'awaiting_claim_decision'. If none remain, resolves exactly
+            like the "otherwise" branch of 'discard' above, using
+            last_discarder as the reference seat; last_discard/
+            last_discarder -> None.
         'declare_win': status -> 'self_draw_win', winner -> current_turn.
 """
 
@@ -1836,6 +1900,197 @@ class TestAddedKong:
         assert len(result.hands[0]) == 12  # 13 - 1 given up, no replacement arrives
         assert result.phase == "awaiting_discard"
         assert result.status == "in_progress"
+
+
+# --- robbing the kong (搶槓), added kong only -------------------------------
+
+def _rob_kong_scenario():
+    """Seat 0 declares added kong on V=man(1) (already has an exposed pung,
+    holds the 4th). Seat 1 CAN win on V (edge chow using man2/man3). Seats
+    2 and 3 cannot. All hand shapes verified independently via
+    is_winning_hand before being hardcoded here."""
+    V = man(1)
+    promoter_hand = [V, man(6), man(7), man(8), pin(6), pin(7), pin(8),
+                      sou(6), sou(7), sou(8), EAST, WEST, NORTH]
+    seat1_hand = [man(2), man(3), pin(1), pin(2), pin(3), pin(4), pin(5),
+                  pin(6), pin(7), pin(8), pin(9), sou(5), sou(5)]
+    seat2_hand = [man(9), man(9), sou(1), sou(1), sou(2), sou(2),
+                  RED_DRAGON, RED_DRAGON, GREEN_DRAGON, GREEN_DRAGON,
+                  WHITE_DRAGON, NORTH, SOUTH]
+    seat3_hand = [man(9), man(9), sou(1), sou(1), sou(2), sou(2),
+                  RED_DRAGON, RED_DRAGON, GREEN_DRAGON, GREEN_DRAGON,
+                  WHITE_DRAGON, NORTH, SOUTH]
+    assert is_winning_hand(seat1_hand + [V]) is True
+    assert is_winning_hand(seat2_hand + [V]) is False
+    assert is_winning_hand(seat3_hand + [V]) is False
+    state = GameState(
+        wall=[man(9), man(8), man(7)],
+        hands=[promoter_hand, seat1_hand, seat2_hand, seat3_hand],
+        melds=[[{"tiles": [V, V, V], "concealed": False}], [], [], []],
+        discards=[[], [], [], []],
+        current_turn=0,
+        phase="awaiting_discard",
+        status="in_progress",
+        winner=None,
+        dealer=0,
+        round_wind=EAST,
+        seat_winds=[EAST, SOUTH, WEST, NORTH],
+        last_discard=None,
+        last_discarder=None,
+    )
+    return state, V
+
+
+class TestRobbingTheKong:
+    def test_win_eligible_seat_is_offered_the_rob(self):
+        state, V = _rob_kong_scenario()
+        result = apply_action(state, {"type": "added_kong", "tile": V})
+
+        assert result.phase == "awaiting_claim_decision"
+        assert result.current_turn == 1
+        assert result.pending_claims == [{"seat": 1, "type": "rob_kong"}]
+        assert legal_actions(result) == [{"type": "rob_kong"}, {"type": "pass"}]
+        # The kong must NOT be finalized while the window is open.
+        assert result.melds[0] == [{"tiles": [V, V, V], "concealed": False}]
+
+    def test_robbing_terminates_the_game_with_the_robber_as_winner(self):
+        state, V = _rob_kong_scenario()
+        offered = apply_action(state, {"type": "added_kong", "tile": V})
+        robbed = apply_action(offered, {"type": "rob_kong"})
+
+        assert robbed.status == "kong_robbed"
+        assert robbed.winner == 1
+        assert V in robbed.hands[1]
+        assert legal_actions(robbed) == []
+
+    def test_meld_stays_an_unpromoted_pung_when_robbed(self):
+        state, V = _rob_kong_scenario()
+        offered = apply_action(state, {"type": "added_kong", "tile": V})
+        robbed = apply_action(offered, {"type": "rob_kong"})
+
+        assert robbed.melds[0] == [{"tiles": [V, V, V], "concealed": False}]
+
+    def test_declining_the_rob_lets_the_kong_complete_normally(self):
+        state, V = _rob_kong_scenario()
+        offered = apply_action(state, {"type": "added_kong", "tile": V})
+        completed = apply_action(offered, {"type": "pass"})
+
+        assert completed.status == "in_progress"
+        assert completed.phase == "awaiting_discard"
+        assert completed.current_turn == 0
+        assert completed.melds[0] == [{"tiles": [V, V, V, V], "concealed": False}]
+        # Replacement drawn from the back (wall[-1] = man(7)), same as
+        # any other kong.
+        assert man(7) in completed.hands[0]
+        assert man(9) not in completed.hands[0]
+        assert completed.wall == [man(9), man(8)]
+        assert completed.last_discard is None
+        assert completed.last_discarder is None
+        assert completed.pending_claims == []
+
+    def test_concealed_kong_is_never_robbable(self):
+        # Seat 1 WOULD win on T if it were robbable (verified below), but
+        # concealed kong never opens a claim window at all -- it just
+        # completes immediately, exactly as if no one could ever rob it.
+        T = man(5)
+        promoter_hand = [T, T, T, T, man(1), man(2), man(3),
+                          pin(6), pin(7), pin(8), sou(1), sou(2), EAST, WEST]
+        seat1_hand = [man(6), man(7), pin(1), pin(2), pin(3), pin(4), pin(5),
+                      pin(6), pin(7), pin(8), pin(9), sou(5), sou(5)]
+        assert is_winning_hand(seat1_hand + [T]) is True
+        filler13 = [man(9), man(9), pin(1), pin(1), sou(9), sou(9),
+                    RED_DRAGON, RED_DRAGON, GREEN_DRAGON, GREEN_DRAGON,
+                    WHITE_DRAGON, NORTH, NORTH]
+        state = GameState(
+            wall=[man(9), man(8), man(7)],
+            hands=[promoter_hand, seat1_hand, list(filler13), list(filler13)],
+            melds=[[], [], [], []],
+            discards=[[], [], [], []],
+            current_turn=0,
+            phase="awaiting_discard",
+            status="in_progress",
+            winner=None,
+            dealer=0,
+            round_wind=EAST,
+            seat_winds=[EAST, SOUTH, WEST, NORTH],
+            last_discard=None,
+            last_discarder=None,
+        )
+        result = apply_action(state, {"type": "concealed_kong", "tile": T})
+
+        assert result.phase == "awaiting_discard"  # no claim window at all
+        assert result.status == "in_progress"
+        assert result.melds[0] == [{"tiles": [T, T, T, T], "concealed": True}]
+        assert result.pending_claims == []
+
+    def test_rob_priority_follows_seat_order_when_multiple_seats_could_win(self):
+        # Reuses _find_discard_win_seat's own seat-order tiebreak (already
+        # proven in TestDiscardWin), applied here to robbing: seat 1 AND
+        # seat 2 can both win on V via the same edge-chow shape, but only
+        # seat 1 -- (promoter+1)%4 -- is ever offered the rob.
+        V = man(1)
+        promoter_hand = [V, man(6), man(7), man(8), pin(6), pin(7), pin(8),
+                          sou(6), sou(7), sou(8), EAST, WEST, NORTH]
+        seat1_hand = [man(2), man(3), pin(1), pin(2), pin(3), pin(4), pin(5),
+                      pin(6), pin(7), pin(8), pin(9), sou(5), sou(5)]
+        seat2_hand = [man(2), man(3), sou(1), sou(2), sou(3), sou(4), sou(5),
+                      sou(6), pin(9), pin(9), SOUTH, SOUTH, SOUTH]
+        seat3_hand = [man(9), man(9), sou(1), sou(1), sou(2), sou(2),
+                      RED_DRAGON, RED_DRAGON, GREEN_DRAGON, GREEN_DRAGON,
+                      WHITE_DRAGON, NORTH, EAST]
+        assert is_winning_hand(seat1_hand + [V]) is True
+        assert is_winning_hand(seat2_hand + [V]) is True
+        assert is_winning_hand(seat3_hand + [V]) is False
+        state = GameState(
+            wall=[man(9), man(8), man(7)],
+            hands=[promoter_hand, seat1_hand, seat2_hand, seat3_hand],
+            melds=[[{"tiles": [V, V, V], "concealed": False}], [], [], []],
+            discards=[[], [], [], []],
+            current_turn=0,
+            phase="awaiting_discard",
+            status="in_progress",
+            winner=None,
+            dealer=0,
+            round_wind=EAST,
+            seat_winds=[EAST, SOUTH, WEST, NORTH],
+            last_discard=None,
+            last_discarder=None,
+        )
+        result = apply_action(state, {"type": "added_kong", "tile": V})
+
+        assert result.pending_claims == [{"seat": 1, "type": "rob_kong"}]
+        assert result.current_turn == 1
+
+    def test_tile_conservation_holds_when_a_kong_is_robbed(self):
+        state, V = _rob_kong_scenario()
+        baseline = total_tiles_in_play(state)
+        offered = apply_action(state, {"type": "added_kong", "tile": V})
+        assert total_tiles_in_play(offered) == baseline
+        robbed = apply_action(offered, {"type": "rob_kong"})
+        assert total_tiles_in_play(robbed) == baseline
+
+    def test_tile_conservation_holds_when_the_rob_is_declined(self):
+        state, V = _rob_kong_scenario()
+        baseline = total_tiles_in_play(state)
+        offered = apply_action(state, {"type": "added_kong", "tile": V})
+        completed = apply_action(offered, {"type": "pass"})
+        assert total_tiles_in_play(completed) == baseline
+        tile_to_discard = completed.hands[0][0]
+        discarded = apply_action(completed, {"type": "discard", "tile": tile_to_discard})
+        assert total_tiles_in_play(discarded) == baseline
+
+    def test_does_not_mutate_the_parent_state(self):
+        state, V = _rob_kong_scenario()
+        offered = apply_action(state, {"type": "added_kong", "tile": V})
+        original_hand1 = list(offered.hands[1])
+        original_meld0 = [dict(m) for m in offered.melds[0]]
+
+        robbed = apply_action(offered, {"type": "rob_kong"})
+        robbed.hands[1].append(999)
+        robbed.melds[0][0]["tiles"].append(999)
+
+        assert offered.hands[1] == original_hand1
+        assert offered.melds[0] == original_meld0
 
 
 class TestClaimQueueGeneralizes:
